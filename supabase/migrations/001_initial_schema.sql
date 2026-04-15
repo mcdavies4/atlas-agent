@@ -79,3 +79,23 @@ create table if not exists company_suggestions (
   created_at   timestamptz default now()
 );
 create index if not exists idx_suggestions_status on company_suggestions(status);
+
+-- ─── User Preferences (preferred company etc) ────────────────────────────────
+create table if not exists user_preferences (
+  phone             text primary key,
+  preferred_company text,
+  language          text default 'english',  -- english / pidgin
+  updated_at        timestamptz default now()
+);
+
+-- ─── Contact Book ─────────────────────────────────────────────────────────────
+create table if not exists contact_book (
+  id         uuid primary key default gen_random_uuid(),
+  phone      text not null,
+  name       text not null,
+  address    text not null,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique(phone, name)
+);
+create index if not exists idx_contacts_phone on contact_book(phone);

@@ -1,6 +1,6 @@
 const { sendMessage } = require('../utils/messenger');
 const { getSession, updateSession, clearSession } = require('../utils/session');
-const { extractDeliveryDetails, getKnowledgeCompanies, synthesiseResults, generateFollowUp } = require('../ai/claude');
+const { extractDeliveryDetails, getKnowledgeCompanies, synthesiseResults } = require('../ai/claude');
 const { searchLogisticsCompanies } = require('../ai/search');
 
 // Existing features
@@ -12,88 +12,132 @@ const { detectPriceComparisonIntent, sortCompanies, formatSortLabel } = require(
 const { detectMultiStopIntent, extractMultiStopDetails, formatMultiStopSummary, getMultiStopSearchContext } = require('../features/multistop');
 const { saveSearchHistory, getSearchHistory, getLastSearch, formatHistory, detectHistoryCommand } = require('../features/history');
 const { detectScheduledIntent, extractScheduleDetails, formatScheduleNote, getScheduleSearchNote, flagScheduledCompanies } = require('../features/scheduled');
-
-// New features
 const { detectHagglingIntent, assessPrice, formatHagglingResponse } = require('../features/haggling');
 const { detectFeedbackRating, saveFeedback, getFeedbackPrompt, getFeedbackResponse } = require('../features/feedback');
 const { enrichCompaniesWithWhatsApp, formatCompanyContact } = require('../features/whatsapp-detect');
 const { detectBusinessIntent, inferBusinessFromContext, getBusinessProfile, saveBusinessProfile, getBusinessRegistrationFlow, parseBusinessRegistration, formatBusinessWelcome, formatBusinessGreeting } = require('../features/business');
 const { detectSuggestionIntent, extractCompanySuggestion, saveSuggestion, getSuggestionPrompt, getSuggestionConfirmation } = require('../features/suggestions');
 
+// New features
+const { detectVertical, searchVertical, formatVerticalResponse } = require('../features/verticals');
+const { detectPidgin, smartResponse, getSmartContextWarnings, getFuelContext } = require('../features/smart-context');
+const { detectPreferredCompanyCommand, getPreferredCompany, setPreferredCompany, clearPreferredCompany, pinPreferredToTop, detectContactCommand, detectContactReference, getContacts, saveContact, deleteContact, formatContactList } = require('../features/personalisation');
+
 const STATES = {
-  IDLE:                'IDLE',
-  COLLECTING:          'COLLECTING',
-  SHOWING:             'SHOWING',
-  FOLLOWUP:            'FOLLOWUP',
-  AWAITING_FEEDBACK:   'AWAITING_FEEDBACK',
-  REGISTERING_BUSINESS:'REGISTERING_BUSINESS',
-  AWAITING_SUGGESTION: 'AWAITING_SUGGESTION',
+  IDLE:                 'IDLE',
+  COLLECTING:           'COLLECTING',
+  SHOWING:              'SHOWING',
+  FOLLOWUP:             'FOLLOWUP',
+  AWAITING_FEEDBACK:    'AWAITING_FEEDBACK',
+  REGISTERING_BUSINESS: 'REGISTERING_BUSINESS',
+  AWAITING_SUGGESTION:  'AWAITING_SUGGESTION',
 };
 
 async function processMessage(phone, text, channel = 'whatsapp') {
-  const session = await getSession(phone);
-  const state   = session?.state || STATES.IDLE;
+  const session  = await getSession(phone);
+  const state    = session?.state || STATES.IDLE;
+  const isPidgin = detectPidgin(text);
 
-  console.log('[' + phone + '][' + channel + '] State: ' + state);
+  console.log('[' + phone + '][' + channel + '] State: ' + state + (isPidgin ? ' [pidgin]' : ''));
 
-  // ── Feedback state ─────────────────────────────────────────────────────────
+  // Helper: send with optional pidgin translation
+  const reply = async (msg) => {
+    const finalMsg = isPidgin ? await smartResponse(text, true, msg) : msg;
+    return sendMessage(phone, finalMsg, channel);
+  };
+
+  // ── Feedback state ──────────────────────────────────────────────────────────
   if (state === STATES.AWAITING_FEEDBACK) {
     const { isFeedback, rating } = detectFeedbackRating(text);
     if (isFeedback) {
       await saveFeedback(phone, rating, session.context);
       await clearSession(phone);
-      return sendMessage(phone, getFeedbackResponse(rating), channel);
+      return reply(getFeedbackResponse(rating));
     }
-    // If they ignore feedback and say something else, let them continue
     await updateSession(phone, { state: STATES.IDLE, context: {} });
   }
 
-  // ── Business registration state ────────────────────────────────────────────
+  // ── Business registration state ─────────────────────────────────────────────
   if (state === STATES.REGISTERING_BUSINESS) {
     const profile = await parseBusinessRegistration(text);
     if (profile) {
       await saveBusinessProfile(phone, profile);
       await updateSession(phone, { state: STATES.IDLE, context: {} });
-      return sendMessage(phone, formatBusinessWelcome(profile), channel);
+      return reply(formatBusinessWelcome(profile));
     }
-    return sendMessage(phone, `Please share in this format:\n_"Business name, pickup address, business type"_\n\nExample: _"ABC Pharmacy, 12 Wuse 2 Abuja, Pharmacy"_`, channel);
+    return reply(`Please share in this format:\n_"Business name, pickup address, business type"_\n\nExample: _"ABC Pharmacy, 12 Wuse 2 Abuja, Pharmacy"_`);
   }
 
-  // ── Company suggestion state ───────────────────────────────────────────────
+  // ── Company suggestion state ────────────────────────────────────────────────
   if (state === STATES.AWAITING_SUGGESTION) {
     const suggestion = await extractCompanySuggestion(text);
     if (suggestion.success) {
       await saveSuggestion(phone, suggestion);
       await updateSession(phone, { state: STATES.IDLE, context: {} });
-      return sendMessage(phone, getSuggestionConfirmation(suggestion.name), channel);
+      return reply(getSuggestionConfirmation(suggestion.name));
     }
-    return sendMessage(phone, `Please share the company name and phone number:\n_"Company name, phone number, city"_`, channel);
+    return reply(`Please share: _"Company name, phone number, city"_`);
   }
 
-  // ── Global commands ────────────────────────────────────────────────────────
+  // ── Global commands ─────────────────────────────────────────────────────────
+
+  // Preferred company
+  const prefCmd = detectPreferredCompanyCommand(text);
+  if (prefCmd) {
+    if (prefCmd.action === 'set') {
+      await setPreferredCompany(phone, prefCmd.company);
+      return reply(`✅ Got it! I'll always show *${prefCmd.company}* first in your results.\n\nSay "remove preferred" to clear this.`);
+    }
+    if (prefCmd.action === 'clear') {
+      await clearPreferredCompany(phone);
+      return reply(`✅ Preferred courier cleared. I'll show all results by default.`);
+    }
+    if (prefCmd.action === 'view') {
+      const pref = await getPreferredCompany(phone);
+      return reply(pref ? `⭐ Your preferred courier: *${pref}*\n\nSay "remove preferred" to clear.` : `You haven't set a preferred courier yet.\n\nSay _"Always show me GIG first"_ to set one.`);
+    }
+  }
+
+  // Contact book
+  const contactCmd = detectContactCommand(text);
+  if (contactCmd) {
+    if (contactCmd.action === 'list') {
+      const contacts = await getContacts(phone);
+      if (!contacts.length) return reply(`No contacts saved yet.\n\nTo save one: _"Emeka lives at 5 Wuse 2 Abuja"_`);
+      return reply(`📒 *Your contacts:*\n\n${formatContactList(contacts)}\n\nSay _"send to Emeka"_ to use a contact in your next search.`);
+    }
+    if (contactCmd.action === 'save') {
+      await saveContact(phone, contactCmd.name, contactCmd.address);
+      return reply(`✅ Saved *${contactCmd.name}* — ${contactCmd.address}\n\nNext time say _"deliver to ${contactCmd.name}"_ and I'll know the address.`);
+    }
+    if (contactCmd.action === 'delete') {
+      await deleteContact(phone, contactCmd.name);
+      return reply(`✅ Removed *${contactCmd.name}* from your contacts.`);
+    }
+  }
 
   // Business registration
   if (detectBusinessIntent(text)) {
     await updateSession(phone, { state: STATES.REGISTERING_BUSINESS, context: {} });
-    return sendMessage(phone, getBusinessRegistrationFlow(), channel);
+    return reply(getBusinessRegistrationFlow());
   }
 
   // Company suggestion
   if (detectSuggestionIntent(text)) {
     await updateSession(phone, { state: STATES.AWAITING_SUGGESTION, context: session?.context || {} });
-    return sendMessage(phone, getSuggestionPrompt(), channel);
+    return reply(getSuggestionPrompt());
   }
 
   // Address management
   const addrCmd = detectAddressCommands(text);
   if (addrCmd === 'list') {
     const addresses = await getSavedAddresses(phone);
-    if (!addresses.length) return sendMessage(phone, `No saved addresses yet.\n\nTo save one: _"Save Wuse 2 as office"_`, channel);
-    return sendMessage(phone, `📍 *Your saved addresses:*\n\n${formatAddressList(addresses)}\n\nTo delete: _"Delete office"_`, channel);
+    if (!addresses.length) return reply(`No saved addresses yet.\n\nTo save: _"Save Wuse 2 as office"_`);
+    return reply(`📍 *Your saved addresses:*\n\n${formatAddressList(addresses)}\n\nTo delete: _"Delete office"_`);
   }
   if (addrCmd?.action === 'delete') {
     await deleteAddress(phone, addrCmd.label);
-    return sendMessage(phone, `✅ Removed *${addrCmd.label}* from your saved addresses.`, channel);
+    return reply(`✅ Removed *${addrCmd.label}*.`);
   }
 
   // Save address
@@ -101,10 +145,10 @@ async function processMessage(phone, text, channel = 'whatsapp') {
   if (saveCmd.isSaveCommand) {
     if (saveCmd.address) {
       await saveAddress(phone, saveCmd.label, saveCmd.address);
-      return sendMessage(phone, `✅ Saved *${saveCmd.address}* as *${saveCmd.label}*.`, channel);
+      return reply(`✅ Saved *${saveCmd.address}* as *${saveCmd.label}*.`);
     } else if (session?.context?.pickup) {
       await saveAddress(phone, saveCmd.label, session.context.pickup);
-      return sendMessage(phone, `✅ Saved *${session.context.pickup}* as *${saveCmd.label}*.`, channel);
+      return reply(`✅ Saved *${session.context.pickup}* as *${saveCmd.label}*.`);
     }
   }
 
@@ -112,116 +156,129 @@ async function processMessage(phone, text, channel = 'whatsapp') {
   const histCmd = detectHistoryCommand(text);
   if (histCmd === 'list') {
     const history = await getSearchHistory(phone);
-    if (!history.length) return sendMessage(phone, `No search history yet.`, channel);
-    return sendMessage(phone, `🕐 *Recent searches:*\n\n${formatHistory(history)}\n\nSay *repeat last* to redo your most recent search.`, channel);
+    if (!history.length) return reply(`No search history yet.`);
+    return reply(`🕐 *Recent searches:*\n\n${formatHistory(history)}\n\nSay *repeat last* to redo your most recent search.`);
   }
   if (histCmd === 'repeat') {
     const last = await getLastSearch(phone);
-    if (!last) return sendMessage(phone, `No previous searches found.`, channel);
-    await sendMessage(phone, `🔄 Repeating: ${last.pickup} → ${last.dropoff}`, channel);
+    if (!last) return reply(`No previous searches found.`);
+    await reply(`🔄 Repeating: ${last.pickup} → ${last.dropoff}`);
     await updateSession(phone, { state: STATES.COLLECTING, context: {} });
     return processMessage(phone, `Send ${last.item_description || 'package'} from ${last.pickup} to ${last.dropoff} in ${last.city}`, channel);
   }
 
-  // Price comparison sort (when showing results)
+  // Sort commands when showing results
   if (state === STATES.SHOWING) {
     const sortMode = detectPriceComparisonIntent(text);
     if (sortMode) {
       const companies = session.context?.companies || [];
       const sorted = sortCompanies(companies, sortMode);
       await updateSession(phone, { state: STATES.SHOWING, context: { ...session.context, companies: sorted } });
-      return sendCompanyList(phone, sorted, session.context, channel, formatSortLabel(sortMode));
-    }
-
-    // Price haggling while viewing results
-    const { isHaggling, quotedPrice } = detectHagglingIntent(text);
-    if (isHaggling) {
-      const assessment = await assessPrice(quotedPrice, session.context);
-      return sendMessage(phone, formatHagglingResponse(assessment, quotedPrice), channel);
+      return sendCompanyList(phone, sorted, session.context, channel, formatSortLabel(sortMode), null, null, null, isPidgin);
     }
   }
 
-  // Price haggling in followup state
-  if (state === STATES.FOLLOWUP) {
+  // Price haggling
+  if ([STATES.SHOWING, STATES.FOLLOWUP].includes(state)) {
     const { isHaggling, quotedPrice } = detectHagglingIntent(text);
     if (isHaggling) {
       const assessment = await assessPrice(quotedPrice, session.context);
-      return sendMessage(phone, formatHagglingResponse(assessment, quotedPrice), channel);
+      const fuelNote   = getFuelContext(quotedPrice);
+      let msg = formatHagglingResponse(assessment, quotedPrice);
+      if (fuelNote) msg += '\n\n' + fuelNote;
+      return reply(msg);
     }
   }
 
   switch (state) {
-    case STATES.IDLE:       return handleIdle(phone, text, session, channel);
-    case STATES.COLLECTING: return handleCollecting(phone, text, session, channel);
-    case STATES.SHOWING:    return handleShowing(phone, text, session, channel);
-    case STATES.FOLLOWUP:   return handleFollowUp(phone, text, session, channel);
-    default:                return handleIdle(phone, text, session, channel);
+    case STATES.IDLE:       return handleIdle(phone, text, session, channel, isPidgin, reply);
+    case STATES.COLLECTING: return handleCollecting(phone, text, session, channel, isPidgin, reply);
+    case STATES.SHOWING:    return handleShowing(phone, text, session, channel, isPidgin, reply);
+    case STATES.FOLLOWUP:   return handleFollowUp(phone, text, session, channel, isPidgin, reply);
+    default:                return handleIdle(phone, text, session, channel, isPidgin, reply);
   }
 }
 
 // ─── IDLE ─────────────────────────────────────────────────────────────────────
 
-async function handleIdle(phone, text, session, channel) {
+async function handleIdle(phone, text, session, channel, isPidgin, reply) {
   const lower = text.toLowerCase();
 
-  if (['hi', 'hello', 'start', 'hey', 'hiya', 'help'].some(k => lower.includes(k)) || !session) {
-    // Check for business account
+  if (['hi', 'hello', 'start', 'hey', 'hiya', 'help', 'how far'].some(k => lower.includes(k)) || !session) {
     const bizProfile = await getBusinessProfile(phone);
     if (bizProfile) {
-      await updateSession(phone, { state: STATES.COLLECTING, context: { pickup: bizProfile.pickup_address, city: bizProfile.city } });
-      return sendMessage(phone, formatBusinessGreeting(bizProfile), channel);
+      await updateSession(phone, { state: STATES.COLLECTING, context: { pickup: bizProfile.pickup_address } });
+      return reply(formatBusinessGreeting(bizProfile));
     }
 
-    const [addresses, history] = await Promise.all([
+    const [addresses, history, contacts] = await Promise.all([
       getSavedAddresses(phone),
       getLastSearch(phone),
+      getContacts(phone),
     ]);
 
-    let welcome = `👋 Welcome to *Atlas* — your AI logistics assistant for Nigeria!\n\nI find the best courier companies for your delivery — with contacts, ratings, prices and reviews.\n\n`;
+    // Check for holiday warnings
+    const warnings = getSmartContextWarnings();
+
+    let welcome = isPidgin
+      ? `👋 How far! Na *Atlas* be dis — your AI logistics helper for Nigeria!\n\nI go find the best courier companies for your delivery — with their numbers, ratings, prices and reviews.\n\n`
+      : `👋 Welcome to *Atlas* — your AI logistics assistant for Nigeria!\n\nI find the best courier companies for your delivery — with contacts, ratings, prices and reviews.\n\n`;
+
+    if (warnings.length > 0) welcome += warnings.join('\n') + '\n\n';
     if (addresses.length > 0) welcome += `📍 *Saved:* ${formatAddressList(addresses)}\n\n`;
-    if (history) welcome += `🕐 *Last search:* ${history.pickup} → ${history.dropoff} · Say *repeat last* to redo\n\n`;
-    welcome += `Tell me about your delivery, or try:\n`;
-    welcome += `• _"Send documents from Wuse 2 to Gwarinpa"_\n`;
-    welcome += `• _"Ship to London"_ for international\n`;
-    welcome += `• _"Register my business"_ for business account\n`;
-    welcome += `• _"Suggest a company"_ to add a courier`;
+    if (contacts.length > 0)  welcome += `📒 *Contacts:* ${contacts.map(c => c.name).join(', ')}\n\n`;
+    if (history) welcome += `🕐 *Last:* ${history.pickup} → ${history.dropoff} · Say *repeat last*\n\n`;
+
+    welcome += isPidgin
+      ? `Wetin you want send? Tell me pickup and dropoff:\n• _"I wan send documents from Wuse 2 go Gwarinpa"_\n• _"Food delivery for Lekki"_\n• _"I dey move house"_\n• _"Ship go London"_`
+      : `Tell me about your delivery:\n• _"Send documents from Wuse 2 to Gwarinpa"_\n• _"Food delivery in Lekki"_\n• _"I'm moving house"_\n• _"Ship to London"_ for international`;
 
     await updateSession(phone, { state: STATES.COLLECTING, context: {} });
     return sendMessage(phone, welcome, channel);
   }
 
-  return handleCollecting(phone, text, { state: STATES.COLLECTING, context: {} }, channel);
+  return handleCollecting(phone, text, { state: STATES.COLLECTING, context: {} }, channel, isPidgin, reply);
 }
 
 // ─── COLLECTING ───────────────────────────────────────────────────────────────
 
-async function handleCollecting(phone, text, session, channel) {
-  if (text.toLowerCase() === 'cancel') {
+async function handleCollecting(phone, text, session, channel, isPidgin, reply) {
+  if (['cancel', 'stop', 'comot'].includes(text.toLowerCase().trim())) {
     await clearSession(phone);
-    return sendMessage(phone, "No problem! Type *hi* whenever you need help. 👍", channel);
+    return reply("No problem! Type *hi* whenever you need help. 👍");
+  }
+
+  // ── Check verticals first ──────────────────────────────────────────────────
+  const { isVertical, vertical, config } = detectVertical(text);
+  if (isVertical) {
+    await reply(`${config.icon} *${config.label}* detected. Searching...`);
+    const context   = session?.context || {};
+    const details   = await extractDeliveryDetails(text, context);
+    const companies = await searchVertical(vertical, details.city || 'Abuja', text);
+    await updateSession(phone, { state: STATES.FOLLOWUP, context: { ...details, vertical } });
+    return reply(formatVerticalResponse(vertical, companies, details.city || 'Abuja', details));
   }
 
   // International
   const intlIntent = detectInternationalIntent(text);
   if (intlIntent.isInternational) {
-    await sendMessage(phone, `✈️ International to *${intlIntent.destination.toUpperCase()}*. Finding options...`, channel);
+    await reply(`✈️ International to *${intlIntent.destination.toUpperCase()}*. Finding options...`);
     const context = session?.context || {};
     const details = await extractDeliveryDetails(text, context);
     const { companies, tips } = await getInternationalOptions(intlIntent.destination, details);
-    await updateSession(phone, { state: STATES.FOLLOWUP, context: { ...details, isInternational: true, destination: intlIntent.destination } });
-    return sendMessage(phone, formatInternationalResponse(intlIntent.destination, companies, tips), channel);
+    await updateSession(phone, { state: STATES.FOLLOWUP, context: { ...details, isInternational: true } });
+    return reply(formatInternationalResponse(intlIntent.destination, companies, tips));
   }
 
   // Multi-stop
   if (detectMultiStopIntent(text)) {
-    await sendMessage(phone, `🗺️ Multi-stop detected. Mapping your route...`, channel);
+    await reply(`🗺️ Multi-stop detected. Mapping your route...`);
     const multiDetails = await extractMultiStopDetails(text);
-    if (!multiDetails.success) {
-      return sendMessage(phone, `Couldn't map stops. Try: _"Pick up from Wuse 2 and Garki, deliver to Gwarinpa"_`, channel);
-    }
-    const stopSummary = formatMultiStopSummary(multiDetails);
+    if (!multiDetails.success) return reply(`Couldn't map stops. Try: _"Pick up from Wuse 2 and Garki, deliver to Gwarinpa"_`);
+
+    const stopSummary   = formatMultiStopSummary(multiDetails);
     const searchContext = getMultiStopSearchContext(multiDetails);
-    await sendMessage(phone, `📋 *Route:*\n${stopSummary}\nSearching...`, channel);
+    await reply(`📋 *Route:*\n${stopSummary}\nSearching...`);
 
     const [kc, sr] = await Promise.all([
       getKnowledgeCompanies({ ...searchContext, itemDescription: multiDetails.itemDescription }),
@@ -230,36 +287,47 @@ async function handleCollecting(phone, text, session, channel) {
     let companies = await synthesiseResults(kc, sr, searchContext);
     companies = await enrichCompaniesWithReviews(companies, sr);
     companies = enrichCompaniesWithWhatsApp(companies);
+    const preferred = await getPreferredCompany(phone);
+    if (preferred) companies = pinPreferredToTop(companies, preferred);
 
     const tips = await getNegotiationTips(searchContext, companies);
     await updateSession(phone, { state: STATES.SHOWING, context: { ...searchContext, companies, isMultiStop: true, stopSummary } });
     await saveSearchHistory(phone, searchContext, companies);
-    return sendCompanyList(phone, companies, searchContext, channel, null, tips, stopSummary);
+    return sendCompanyList(phone, companies, searchContext, channel, null, tips, stopSummary, null, isPidgin);
   }
 
   // Resolve saved addresses
   const resolved = await resolveAddress(phone, text);
-  let processedText = resolved.resolved ? text.replace(new RegExp(resolved.label, 'gi'), resolved.address) : text;
+  let processedText = resolved.resolved
+    ? text.replace(new RegExp(resolved.label, 'gi'), resolved.address)
+    : text;
 
-  // Detect business context
-  const isBusinessSender = inferBusinessFromContext(processedText);
-  const bizProfile = isBusinessSender ? await getBusinessProfile(phone) : null;
+  // Resolve contacts
+  const contacts = await getContacts(phone);
+  const contactRef = detectContactReference(processedText, contacts);
+  if (contactRef) {
+    processedText = processedText.replace(new RegExp(contactRef.name, 'gi'), contactRef.address);
+  }
+
+  // Business context
+  const bizProfile = await getBusinessProfile(phone);
   if (bizProfile && !processedText.toLowerCase().includes(bizProfile.pickup_address.toLowerCase())) {
-    processedText = processedText + ` (pickup from ${bizProfile.pickup_address})`;
+    processedText += ` (pickup from ${bizProfile.pickup_address})`;
   }
 
   // Scheduled
-  const hasSchedule = detectScheduledIntent(processedText);
   let schedule = null;
-  if (hasSchedule) schedule = await extractScheduleDetails(processedText);
+  if (detectScheduledIntent(processedText)) {
+    schedule = await extractScheduleDetails(processedText);
+  }
 
-  await sendMessage(phone, "🔍 Searching for the best options...", channel);
+  await reply("🔍 Searching for the best options...");
 
   const context = session?.context || {};
   const details = await extractDeliveryDetails(processedText, context);
 
   if (!details.success) {
-    return sendMessage(phone, `Couldn't get that. Please include:\n📍 Pickup · 📍 Dropoff · 📦 Item`, channel);
+    return reply(`Couldn't get that. Please include:\n📍 Pickup · 📍 Dropoff · 📦 Item`);
   }
 
   const missing = [];
@@ -267,12 +335,17 @@ async function handleCollecting(phone, text, session, channel) {
   if (!details.dropoff) missing.push('📍 *drop-off location*');
   if (missing.length > 0) {
     await updateSession(phone, { state: STATES.COLLECTING, context: { ...context, ...details } });
-    return sendMessage(phone, `Almost there! I still need:\n${missing.join('\n')}`, channel);
+    return reply(`Almost there! I still need:\n${missing.join('\n')}`);
   }
 
   const scheduleNote = formatScheduleNote(schedule);
-  if (scheduleNote) await sendMessage(phone, scheduleNote, channel);
-  await sendMessage(phone, "⚡ Checking companies...", channel);
+  if (scheduleNote) await reply(scheduleNote);
+
+  // Check for holiday warnings
+  const warnings = getSmartContextWarnings();
+  if (warnings.length > 0) await reply(warnings.join('\n'));
+
+  await reply("⚡ Checking companies...");
 
   const [kc, sr] = await Promise.all([
     getKnowledgeCompanies(details),
@@ -284,63 +357,73 @@ async function handleCollecting(phone, text, session, channel) {
   companies = enrichCompaniesWithWhatsApp(companies);
   if (schedule?.hasSchedule) companies = flagScheduledCompanies(companies, schedule);
 
+  // Pin preferred company to top
+  const preferred = await getPreferredCompany(phone);
+  if (preferred) companies = pinPreferredToTop(companies, preferred);
+
   if (!companies || companies.length === 0) {
     await updateSession(phone, { state: STATES.COLLECTING, context: {} });
-    return sendMessage(phone, `Couldn't find companies for that route. Try adding the city name.`, channel);
+    return reply(`Couldn't find companies for that route. Try adding the city name.`);
   }
 
   const tips = await getNegotiationTips(details, companies);
   await updateSession(phone, { state: STATES.SHOWING, context: { ...details, companies, schedule } });
   await saveSearchHistory(phone, details, companies);
-  return sendCompanyList(phone, companies, details, channel, null, tips, null, schedule);
+  return sendCompanyList(phone, companies, details, channel, null, tips, null, schedule, isPidgin);
 }
 
 // ─── SEND COMPANY LIST ────────────────────────────────────────────────────────
 
-async function sendCompanyList(phone, companies, context, channel, sortLabel, tips, stopSummary, schedule) {
+async function sendCompanyList(phone, companies, context, channel, sortLabel, tips, stopSummary, schedule, isPidgin) {
   let response = `✅ *Best logistics options:*\n`;
   if (stopSummary) response += `\n📋 *Route:*\n${stopSummary}\n`;
-  if (schedule?.hasSchedule) response += `📅 *Scheduled:* ${schedule.dateLabel}${schedule.timeLabel ? ' at ' + schedule.timeLabel : ''}\n`;
+  if (schedule?.hasSchedule) response += `📅 ${schedule.dateLabel}${schedule.timeLabel ? ' at ' + schedule.timeLabel : ''}\n`;
   if (context.pickup && context.dropoff) response += `📍 ${context.pickup} → ${context.dropoff}\n`;
   if (sortLabel) response += `${sortLabel}\n`;
   response += '\n';
 
   companies.forEach((c, i) => {
-    response += `*${i + 1}. ${c.name}*\n`;
+    if (c.isPinned) response += `⭐ *${i + 1}. ${c.name}* _(preferred)_\n`;
+    else response += `*${i + 1}. ${c.name}*\n`;
     response += formatCompanyContact(c) + '\n';
     if (c.rating)        response += `⭐ ${c.rating}/5\n`;
     if (c.priceHint)     response += `💰 ${c.priceHint}\n`;
     if (c.reviewSummary) response += `💬 _${c.reviewSummary}_\n`;
     if (c.scheduledNote) response += `${c.scheduledNote}\n`;
-    if (c.multiStopNote) response += `${c.multiStopNote}\n`;
     if (c.website)       response += `🌐 ${c.website}\n`;
     response += '\n';
   });
 
   if (tips && tips.length > 0) response += formatTips(tips) + '\n\n';
 
-  response += `Reply with a *number* to pick · *cheapest* · *best rated* · *NEW* to search again\n`;
-  response += `💡 _Got a quote? Say "they quoted me ₦5,000, is that fair?" and I'll check it._`;
+  response += `Reply *number* to pick · *cheapest* · *best rated* · *NEW* to search again\n`;
+  response += `💡 _Got a quote? Say "they quoted me ₦5,000, is that fair?"_`;
+
+  if (isPidgin) {
+    const { smartResponse } = require('../features/smart-context');
+    const pidginResponse = await smartResponse(null, true, response);
+    return sendMessage(phone, pidginResponse, channel);
+  }
 
   return sendMessage(phone, response, channel);
 }
 
 // ─── SHOWING ──────────────────────────────────────────────────────────────────
 
-async function handleShowing(phone, text, session, channel) {
+async function handleShowing(phone, text, session, channel, isPidgin, reply) {
   const lower = text.toLowerCase().trim();
 
-  if (lower === 'cancel') { await clearSession(phone); return sendMessage(phone, "Cancelled. Type *hi* to start again.", channel); }
-  if (['new', 'search again', 'back'].includes(lower)) {
+  if (['cancel', 'comot'].includes(lower)) { await clearSession(phone); return reply("Cancelled. Type *hi* to start again."); }
+  if (['new', 'search again', 'back', 'another'].includes(lower)) {
     await updateSession(phone, { state: STATES.COLLECTING, context: {} });
-    return sendMessage(phone, "Tell me about your delivery 👇", channel);
+    return reply("Tell me about your delivery 👇");
   }
 
   const choice    = parseInt(text.trim(), 10);
   const companies = session.context?.companies || [];
 
   if (isNaN(choice) || choice < 1 || choice > companies.length) {
-    return sendMessage(phone, `Reply with a number between 1 and ${companies.length}, or *NEW* to search again.`, channel);
+    return reply(`Reply with a number between 1 and ${companies.length}, or *NEW* to search again.`);
   }
 
   const selected = companies[choice - 1];
@@ -352,44 +435,41 @@ async function handleShowing(phone, text, session, channel) {
   let msg = `✅ *Great choice — ${selected.name}!*\n\n`;
   msg += formatCompanyContact(selected) + '\n';
   if (selected.website)   msg += `🌐 ${selected.website}\n`;
-  if (context.schedule?.hasSchedule) msg += `📅 Mention your time: ${context.schedule.dateLabel}${context.schedule.timeLabel ? ' at ' + context.schedule.timeLabel : ''}\n`;
+  if (context.schedule?.hasSchedule) msg += `📅 Mention your time: ${context.schedule.dateLabel}\n`;
   msg += '\n';
   if (aiTips) msg += `💡 *Before you call:*\n${aiTips}\n\n`;
-  msg += `💾 _Save address? Say "save ${context.pickup} as home"_\n\n`;
-  msg += `Reply *DONE* · *NEW* for another search · or share their quote and I'll check if it's fair`;
+  msg += `💾 _Save address? "save ${context.pickup} as home"_\n`;
+  msg += `👤 _Save recipient? "Emeka lives at ${context.dropoff}"_\n\n`;
+  msg += `Reply *DONE* · *NEW* for another search · or share their quote to check if it's fair`;
 
-  return sendMessage(phone, msg, channel);
+  return reply(msg);
 }
 
 // ─── FOLLOW UP ────────────────────────────────────────────────────────────────
 
-async function handleFollowUp(phone, text, session, channel) {
+async function handleFollowUp(phone, text, session, channel, isPidgin, reply) {
   const lower = text.toLowerCase().trim();
 
-  if (['done', 'sorted', 'thanks', 'thank you', 'ok thanks', 'great'].includes(lower)) {
-    // Ask for feedback before closing
+  if (['done', 'sorted', 'thanks', 'thank you', 'ok', 'great', 'e don do'].includes(lower)) {
     await updateSession(phone, { state: STATES.AWAITING_FEEDBACK, context: session.context });
-    return sendMessage(phone, getFeedbackPrompt(), channel);
+    return reply(getFeedbackPrompt());
   }
-
-  if (['new', 'search again'].includes(lower)) {
+  if (['new', 'search again', 'another', 'abeg another'].includes(lower)) {
     await updateSession(phone, { state: STATES.COLLECTING, context: {} });
-    return sendMessage(phone, "Tell me about your next delivery 👇", channel);
+    return reply("Tell me about your next delivery 👇");
   }
-
   if (['international', 'ship abroad'].includes(lower)) {
     await updateSession(phone, { state: STATES.COLLECTING, context: {} });
-    return sendMessage(phone, "Where do you want to ship to and what are you sending?", channel);
+    return reply("Where do you want to ship to and what are you sending?");
   }
-
   if (lower === 'suggest a company') {
     await updateSession(phone, { state: STATES.AWAITING_SUGGESTION, context: session.context });
-    return sendMessage(phone, getSuggestionPrompt(), channel);
+    return reply(getSuggestionPrompt());
   }
 
-  return sendMessage(phone,
-    `Need anything else?\n\n*NEW* — new search\n*INTERNATIONAL* — ship outside Nigeria\n*my history* — past searches\n*suggest a company* — add a courier\n*DONE* — all sorted 👍`,
-    channel);
+  return reply(
+    `Need anything else?\n\n*NEW* — new search\n*INTERNATIONAL* — ship outside Nigeria\n*my history* — past searches\n*my contacts* — saved recipients\n*suggest a company* — add a courier\n*DONE* — all sorted 👍`
+  );
 }
 
 module.exports = { processMessage };
