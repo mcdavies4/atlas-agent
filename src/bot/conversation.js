@@ -13,7 +13,7 @@ const { detectMultiStopIntent, extractMultiStopDetails, formatMultiStopSummary, 
 const { saveSearchHistory, getSearchHistory, getLastSearch, formatHistory, detectHistoryCommand } = require('../features/history');
 const { detectScheduledIntent, extractScheduleDetails, formatScheduleNote, getScheduleSearchNote, flagScheduledCompanies } = require('../features/scheduled');
 const { detectHagglingIntent, assessPrice, formatHagglingResponse } = require('../features/haggling');
-const { detectFeedbackRating, saveFeedback, getFeedbackPrompt, getFeedbackResponse } = require('../features/feedback');
+const { detectFeedbackRating, saveFeedback, getFeedbackPrompt, getFeedbackResponse, getPositiveFollowUp, parseCompanyDetails, saveVerifiedCompany, getCompanySaveConfirmation, getSkipResponse } = require('../features/feedback');
 const { enrichCompaniesWithWhatsApp, formatCompanyContact } = require('../features/whatsapp-detect');
 const { detectBusinessIntent, inferBusinessFromContext, getBusinessProfile, saveBusinessProfile, getBusinessRegistrationFlow, parseBusinessRegistration, formatBusinessWelcome, formatBusinessGreeting } = require('../features/business');
 const { detectSuggestionIntent, extractCompanySuggestion, saveSuggestion, getSuggestionPrompt, getSuggestionConfirmation } = require('../features/suggestions');
@@ -24,13 +24,14 @@ const { detectPidgin, smartResponse, getSmartContextWarnings, getFuelContext } =
 const { detectPreferredCompanyCommand, getPreferredCompany, setPreferredCompany, clearPreferredCompany, pinPreferredToTop, detectContactCommand, detectContactReference, getContacts, saveContact, deleteContact, formatContactList } = require('../features/personalisation');
 
 const STATES = {
-  IDLE:                 'IDLE',
-  COLLECTING:           'COLLECTING',
-  SHOWING:              'SHOWING',
-  FOLLOWUP:             'FOLLOWUP',
-  AWAITING_FEEDBACK:    'AWAITING_FEEDBACK',
-  REGISTERING_BUSINESS: 'REGISTERING_BUSINESS',
-  AWAITING_SUGGESTION:  'AWAITING_SUGGESTION',
+  IDLE:                    'IDLE',
+  COLLECTING:              'COLLECTING',
+  SHOWING:                 'SHOWING',
+  FOLLOWUP:                'FOLLOWUP',
+  AWAITING_FEEDBACK:       'AWAITING_FEEDBACK',
+  AWAITING_COMPANY_DETAILS:'AWAITING_COMPANY_DETAILS',
+  REGISTERING_BUSINESS:    'REGISTERING_BUSINESS',
+  AWAITING_SUGGESTION:     'AWAITING_SUGGESTION',
 };
 
 async function processMessage(phone, text, channel = 'whatsapp') {
@@ -51,10 +52,40 @@ async function processMessage(phone, text, channel = 'whatsapp') {
     const { isFeedback, rating } = detectFeedbackRating(text);
     if (isFeedback) {
       await saveFeedback(phone, rating, session.context);
-      await clearSession(phone);
-      return reply(getFeedbackResponse(rating));
+
+      if (rating >= 4) {
+        // Positive rating — ask for company details
+        const companyName = session.context?.selectedCompany?.name || null;
+        const followUp    = getPositiveFollowUp(rating, companyName);
+        await updateSession(phone, {
+          state:   STATES.AWAITING_COMPANY_DETAILS,
+          context: { ...session.context, feedbackRating: rating },
+        });
+        return reply(followUp);
+      } else {
+        // Low rating — close out
+        const response = getFeedbackResponse(rating);
+        await clearSession(phone);
+        return reply(response);
+      }
     }
     await updateSession(phone, { state: STATES.IDLE, context: {} });
+  }
+
+  // ── Company details state ───────────────────────────────────────────────────
+  if (state === STATES.AWAITING_COMPANY_DETAILS) {
+    const companyName = session.context?.selectedCompany?.name || null;
+    const { skipped, name, phone: companyPhone } = parseCompanyDetails(text, companyName);
+
+    if (skipped) {
+      await clearSession(phone);
+      return reply(getSkipResponse());
+    }
+
+    // Save the company data
+    await saveVerifiedCompany(phone, { name, phone: companyPhone }, session.context);
+    await clearSession(phone);
+    return reply(getCompanySaveConfirmation(name || companyName));
   }
 
   // ── Business registration state ─────────────────────────────────────────────

@@ -99,3 +99,20 @@ create table if not exists contact_book (
   unique(phone, name)
 );
 create index if not exists idx_contacts_phone on contact_book(phone);
+
+-- ─── Verified Companies (user-reported) ──────────────────────────────────────
+create table if not exists verified_companies (
+  id            uuid primary key default gen_random_uuid(),
+  name          text not null,
+  phone         text,
+  city          text,
+  route_pickup  text,
+  route_dropoff text,
+  reported_by   text not null,
+  mention_count integer default 1,
+  status        text default 'unverified',  -- unverified / verified / rejected
+  created_at    timestamptz default now(),
+  updated_at    timestamptz default now()
+);
+create index if not exists idx_verified_companies_status on verified_companies(status);
+create index if not exists idx_verified_companies_city   on verified_companies(city);
