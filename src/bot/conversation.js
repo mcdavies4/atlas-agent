@@ -463,6 +463,17 @@ async function handleShowing(phone, text, session, channel, isPidgin, reply) {
 
   await updateSession(phone, { state: STATES.FOLLOWUP, context: { ...context, selectedCompany: selected } });
 
+  // Fix: update search history with the actually selected company
+  const { supabase } = require('../utils/supabase');
+  await supabase
+    .from('search_history')
+    .update({ top_company: selected.name, selected_company: selected.name })
+    .eq('phone', phone)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .then(() => {})
+    .catch(err => console.error('Search history update error:', err));
+
   let msg = `✅ *Great choice — ${selected.name}!*\n\n`;
   msg += formatCompanyContact(selected) + '\n';
   if (selected.website)   msg += `🌐 ${selected.website}\n`;
